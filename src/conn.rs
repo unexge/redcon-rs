@@ -9,6 +9,8 @@ use tokio::{net::tcp::OwnedWriteHalf, net::TcpListener};
 
 use crate::resp::{Error, Type};
 
+pub type Command = Vec<String>;
+
 #[derive(Clone, Debug)]
 pub struct Conn {
     // TODO: is it possible without mutex?
@@ -61,7 +63,7 @@ impl Conn {
 
 pub async fn listen<Handler, Fut>(addr: &str, handler: Handler) -> Result<()>
 where
-    Handler: Fn(Conn, Type) -> Fut + Send + Sync + 'static,
+    Handler: Fn(Conn, Command) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let listener = TcpListener::bind(addr).await?;
@@ -76,7 +78,7 @@ where
             let conn = Conn::new(write);
 
             loop {
-                let cmd = match Type::read(&mut read).await {
+                let ty = match Type::read(&mut read).await {
                     Ok(it) => it,
                     Err(err) => {
                         if let Some(Error::UnexpectedEof) = err.downcast_ref::<Error>() {
@@ -87,11 +89,41 @@ where
                     }
                 };
 
+                let cmd = match type_to_command(ty) {
+                    Some(it) => it,
+                    None => {
+                        eprintln!("invalid command");
+                        if let Err(err) = conn
+                            .write_error("ERR expected array of bulk strings".to_string())
+                            .await
+                        {
+                            eprintln!("could not write to client: {}", err);
+                        }
+                        continue;
+                    }
+                };
+
                 let conn = conn.clone();
                 let handler = Arc::clone(&handler);
                 tokio::spawn(handler(conn, cmd));
             }
         });
+    }
+}
+
+fn type_to_command(ty: Type) -> Option<Command> {
+    if let Type::Array(arr) = ty {
+        arr.into_iter()
+            .map(|t| {
+                if let Type::BulkString(s) = t {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        None
     }
 }
 
@@ -115,7 +147,7 @@ mod tests {
         handler: Handler,
     ) -> Result<(Server, BufStream<TcpStream>)>
     where
-        Handler: Fn(Conn, Type) -> Fut + Send + Sync + 'static,
+        Handler: Fn(Conn, Command) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -148,14 +180,14 @@ mod tests {
     #[tokio::test]
     async fn accept_connections() -> Result<()> {
         let (_server, mut client) =
-            server_and_client("127.0.0.1:6379", |conn: Conn, cmd: Type| async move {
+            server_and_client("127.0.0.1:6379", |conn: Conn, cmd: Command| async move {
                 // FIXME: this panic is not propagated.
-                assert!(matches!(cmd, Type::SimpleString(cmd) if cmd == "ping"));
+                assert!(matches!(cmd.as_slice(), &[ref c] if c == "ping"));
                 conn.write_simple_string("pong".to_string()).await.unwrap();
             })
             .await?;
 
-        Type::SimpleString("ping".to_string())
+        Type::Array(vec![Type::BulkString("ping".to_string())])
             .write(&mut client)
             .await?;
 
@@ -170,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn writing_to_conn() -> Result<()> {
         let (_server, mut client) =
-            server_and_client("127.0.0.1:6380", |conn: Conn, _cmd: Type| async move {
+            server_and_client("127.0.0.1:6380", |conn: Conn, _cmd: Command| async move {
                 conn.write_simple_string("simple string".to_string())
                     .await
                     .unwrap();
@@ -186,7 +218,7 @@ mod tests {
             })
             .await?;
 
-        Type::SimpleString("start".to_string())
+        Type::Array(vec![Type::BulkString("start".to_string())])
             .write(&mut client)
             .await?;
 
@@ -207,6 +239,44 @@ mod tests {
         assert_eq!(
             Type::read(&mut client).await?,
             Type::Array(vec![Type::Null, Type::Integer(42)])
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_accepts_array_of_bulk_strings_as_command() -> Result<()> {
+        let (_server, mut client) =
+            server_and_client("127.0.0.1:6381", |conn: Conn, _cmd: Command| async move {
+                conn.write_simple_string("ok".to_string()).await.unwrap();
+            })
+            .await?;
+
+        Type::SimpleString("ping".to_string())
+            .write(&mut client)
+            .await?;
+        assert_eq!(
+            Type::read(&mut client).await?,
+            Type::Error("ERR expected array of bulk strings".to_string())
+        );
+
+        Type::Array(vec![
+            Type::BulkString("ping".to_string()),
+            Type::SimpleString("ok".to_string()),
+        ])
+        .write(&mut client)
+        .await?;
+        assert_eq!(
+            Type::read(&mut client).await?,
+            Type::Error("ERR expected array of bulk strings".to_string())
+        );
+
+        Type::Array(vec![Type::BulkString("ping".to_string())])
+            .write(&mut client)
+            .await?;
+        assert_eq!(
+            Type::read(&mut client).await?,
+            Type::SimpleString("ok".to_string())
         );
 
         Ok(())
