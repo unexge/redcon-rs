@@ -99,32 +99,61 @@ where
 mod tests {
     use std::time::Duration;
 
+    use tokio::io::BufStream;
     use tokio::net::TcpStream;
+    use tokio::sync::oneshot;
     use tokio::time::{sleep, timeout};
 
     use super::*;
 
+    struct Server {
+        _shutdown_tx: oneshot::Sender<()>,
+    }
+
+    async fn server_and_client<Handler, Fut>(
+        addr: &'static str,
+        handler: Handler,
+    ) -> Result<(Server, BufStream<TcpStream>)>
+    where
+        Handler: Fn(Conn, Type) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            tokio::select! {
+                res = listen(addr, handler) => {
+                    if let Err(err) = res {
+                        panic!("could not listen: {}", err);
+                    };
+                },
+                _ = shutdown_rx => {},
+            };
+        });
+
+        // FIXME: wait for listening signal from Server.
+        sleep(Duration::from_millis(10)).await;
+
+        let client = timeout(Duration::from_millis(10), TcpStream::connect(addr)).await??;
+        let client = BufStream::new(client);
+
+        Ok((
+            Server {
+                _shutdown_tx: shutdown_tx,
+            },
+            client,
+        ))
+    }
+
     #[tokio::test]
     async fn accept_connections() -> Result<()> {
-        tokio::spawn(async {
-            listen("127.0.0.1:6379", |conn: Conn, cmd: Type| async move {
+        let (_server, mut client) =
+            server_and_client("127.0.0.1:6379", |conn: Conn, cmd: Type| async move {
                 // FIXME: this panic is not propagated.
                 assert!(matches!(cmd, Type::SimpleString(cmd) if cmd == "ping"));
                 conn.write_simple_string("pong".to_string()).await.unwrap();
             })
-            .await
-            .expect("could not listen");
-        });
-
-        // FIXME: introduce test server.
-        sleep(Duration::from_millis(10)).await;
-
-        let client = timeout(
-            Duration::from_millis(10),
-            TcpStream::connect("127.0.0.1:6379"),
-        )
-        .await??;
-        let mut client = tokio::io::BufStream::new(client);
+            .await?;
 
         Type::SimpleString("ping".to_string())
             .write(&mut client)
@@ -140,8 +169,8 @@ mod tests {
 
     #[tokio::test]
     async fn writing_to_conn() -> Result<()> {
-        tokio::spawn(async {
-            listen("127.0.0.1:6380", |conn: Conn, _cmd: Type| async move {
+        let (_server, mut client) =
+            server_and_client("127.0.0.1:6380", |conn: Conn, _cmd: Type| async move {
                 conn.write_simple_string("simple string".to_string())
                     .await
                     .unwrap();
@@ -155,26 +184,14 @@ mod tests {
                     .await
                     .unwrap();
             })
-            .await
-            .expect("could not listen");
-        });
-
-        // FIXME: introduce test server.
-        sleep(Duration::from_millis(10)).await;
-
-        let client = timeout(
-            Duration::from_millis(10),
-            TcpStream::connect("127.0.0.1:6380"),
-        )
-        .await??;
-        let mut client = tokio::io::BufStream::new(client);
+            .await?;
 
         Type::SimpleString("start".to_string())
             .write(&mut client)
             .await?;
 
         assert_eq!(
-            dbg!(Type::read(&mut client).await?),
+            Type::read(&mut client).await?,
             Type::SimpleString("simple string".to_string())
         );
         assert_eq!(
